@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import sys
 
+from symbol_tracker import ParserRegistry, SymbolTracker
+from symbol_tracker.parsers.python_parser import PythonASTParser
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -30,6 +33,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_undo = sub.add_parser("undo", help="Roll back the last commit.")
     add_common(p_undo)
+
+    p_symbols = sub.add_parser(
+        "symbols", help="Show function/symbol-level changes (Python only)."
+    )
+    add_common(p_symbols)
+    p_symbols.add_argument(
+        "--format",
+        choices=["llm", "compact"],
+        default="llm",
+        help="llm: structured Markdown for prompts; compact: one line per change.",
+    )
 
     return parser
 
@@ -60,6 +74,27 @@ def main(argv: list[str] | None = None) -> int:
             print("Baseline rolled back by one commit.")
         else:
             print("Nothing to undo.")
+        return 0
+
+    if args.command == "symbols":
+        registry = ParserRegistry()
+        registry.register(".py", PythonASTParser())
+        symbol_tracker = SymbolTracker(tracker, registry)
+        symbol_cs = symbol_tracker.scan_symbols()
+
+        if not symbol_cs.has_changes:
+            print("No symbol-level changes detected.")
+            return 0
+
+        if args.format == "compact":
+            for ch in symbol_cs.added:
+                print(f"[ADDED]    {ch.file_path} :: {ch.symbol_name}")
+            for ch in symbol_cs.modified:
+                print(f"[MODIFIED] {ch.file_path} :: {ch.symbol_name}")
+            for ch in symbol_cs.deleted:
+                print(f"[DELETED]  {ch.file_path} :: {ch.symbol_name}")
+        else:
+            print(symbol_cs.to_llm_text())
         return 0
 
     return 1

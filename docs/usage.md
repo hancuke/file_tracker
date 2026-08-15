@@ -63,32 +63,148 @@ tracker.undo()
 | 提交失败回滚 | `baseline.save` 抛异常 | Baseline 保持不变 |
 | 两次提交后 `undo()` | — | 回滚到第一次提交后的状态，工作区源码不变 |
 
-### 1.2 CLI 测试用例
+### 1.2 CLI 完整使用指南
+
+CLI 入口为 `filetracker.cli`，所有子命令共享两个通用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--root` | 要追踪的根目录，默认 `.` |
+| `--exclude` | 多个 glob 模式，如 `--exclude "*.pyc" "__pycache__"` |
+
+> 若已 `pip install -e .`，可直接用 `filetracker` 代替 `python -m filetracker.cli`。
+
+#### 子命令一览
+
+| 子命令 | 作用 | 是否改动 Baseline |
+| --- | --- | --- |
+| `scan` | 列出相对 Baseline 的文件级变更（只读） | 否 |
+| `commit` | 将当前工作区状态写入 Baseline | 是（原子） |
+| `undo` | 回滚最近一次提交 | 是（仅动 Baseline，不动源码） |
+| `symbols` | 列出函数/符号级变更（Python） | 否 |
+
+退出码：成功 `0`；`undo` 时无内容可回滚也返回 `0`（打印 `Nothing to undo.`）。可据此在脚本里判断是否继续。
+
+#### 1) `scan` —— 只读扫描
 
 ```bash
-# 1) 扫描（只读，不推进 Baseline）
 python -m filetracker.cli scan --root ./src
-# 输出：Changes: 1 added, 0 modified, 0 deleted.
-#       [added] app.py
+# 尚无 Baseline 时，所有文件视为 added：
+#   Changes: 1 added, 0 modified, 0 deleted.
+#     [added] services/user_service.py
+```
 
-# 2) 提交（写入 Baseline）
-python -m filetracker.cli commit --root ./src -m "init"
-# 输出：Baseline advanced.
+修改文件后再扫描：
 
-# 3) 修改文件后再扫描
+```bash
 python -m filetracker.cli scan --root ./src
-# 输出：Changes: 0 added, 1 modified, 0 deleted.
+#   Changes: 0 added, 1 modified, 0 deleted.
+#     [modified] services/user_service.py
+```
 
-# 4) 回滚
+#### 2) `commit` —— 推进 Baseline
+
+```bash
+python -m filetracker.cli commit --root ./src -m "initial import"
+#   Baseline advanced.
+```
+
+`-m/--message` 会记录在 `manifest.json` 的 `message` 字段中（见 §1.1）。
+
+#### 3) `undo` —— 回滚
+
+```bash
 python -m filetracker.cli undo --root ./src
-# 输出：Baseline rolled back by one commit.
+#   Baseline rolled back by one commit.
+
+# 没有可回滚内容时：
+#   Nothing to undo.
 ```
 
-CLI 的 `--exclude` 接受多个 glob 模式：
+#### 4) `symbols` —— 函数级变更（用于文档自动更新场景）
+
+`symbols` 在 `scan` 之上叠加 Python AST 解析，输出“改了哪些函数”。这是把代码变更喂给 LLM 的关键一步。
 
 ```bash
-python -m filetracker.cli scan --root ./src --exclude "*.pyc" "__pycache__"
+# 紧凑模式：每行一个变更，便于脚本解析
+python -m filetracker.cli symbols --root ./src --format compact
+#   [ADDED]    services/user_service.py :: validate_email_format
+#   [ADDED]    services/user_service.py :: verify_code
+#   [MODIFIED] services/user_service.py :: update_email
+
+# llm 模式（默认）：结构化 Markdown，可直接粘进 Prompt 的 “Code Changes” 段
+python -m filetracker.cli symbols --root ./src
+#   ## Added Symbols
+#   ### function: `validate_email_format`
+#   - file: `services/user_service.py`
+#   - signature: `def validate_email_format(email)`
+#   - lines: 1-2
+#   ```python
+#   def validate_email_format(email):
+#       return "@" in email and "." in email
+#   ```
+#   ### function: `verify_code`
+#   ...
+#   ## Modified Symbols
+#   ### function: `update_email`
+#   ...
 ```
+
+> `--format llm` 的输出与 `SymbolChangeSet.to_llm_text()` 完全一致，可作为 §3 “自动更新文档” Prompt 的 **Code Changes** 部分直接复用。
+
+#### 5) 端到端工作流（真实可复现）
+
+下面用同一个 `services/user_service.py` 演示从初始化到回滚的完整闭环（输出已实跑验证）：
+
+```bash
+# 准备 v1 源码
+cat > src/services/user_service.py <<'EOF'
+def update_email(user_id, new_email):
+    if "@" not in new_email:
+        raise ValueError("Invalid email")
+    return True
+EOF
+
+python -m filetracker.cli scan --root ./src
+#   Changes: 1 added, 0 modified, 0 deleted.
+#     [added] services/user_service.py
+
+python -m filetracker.cli commit --root ./src -m "initial import"
+#   Baseline advanced.
+
+# 升级到 v2：新增两个函数、改写 update_email
+cat > src/services/user_service.py <<'EOF'
+def validate_email_format(email):
+    return "@" in email and "." in email
+
+def update_email(user_id, new_email):
+    if not validate_email_format(new_email):
+        raise ValueError("Invalid email")
+    send_verification_email(user_id, new_email)
+    return True
+
+def verify_code(user_id, code):
+    """验证用户输入的邮箱验证码"""
+    return redis_client.get(f"code:{user_id}") == code
+EOF
+
+python -m filetracker.cli symbols --root ./src --format compact
+#   [ADDED]    services/user_service.py :: validate_email_format
+#   [ADDED]    services/user_service.py :: verify_code
+#   [MODIFIED] services/user_service.py :: update_email
+
+python -m filetracker.cli commit --root ./src -m "add verify_code"
+#   Baseline advanced.
+
+python -m filetracker.cli undo --root ./src
+#   Baseline rolled back by one commit.
+
+python -m filetracker.cli scan --root ./src
+#   Changes: 0 added, 1 modified, 0 deleted.   <- 回滚后再次看到 v2 的改动
+#     [modified] services/user_service.py
+```
+
+> 把上面第 4 步的 `symbols --format llm` 输出，连同文档对应段落，套进 §3.3 的 Prompt 模板，即可驱动 LLM 更新文档；只有文档校验通过后才执行 `commit`（Gold Rule #3）。
 
 ---
 
@@ -367,5 +483,6 @@ ALL ASSERTIONS PASSED
 | `tests/filetracker/test_scanner.py` | 递归扫描、exclude 模式、Baseline 目录排除、元数据记录 |
 | `tests/filetracker/test_baseline.py` | 原子写（`*.tmp`→`replace`）、崩溃不破坏 manifest、快照 push/pop |
 | `tests/filetracker/test_tracker.py` | 扫描/提交/回滚、失败提交回滚、undo 快照、commit 元数据、diff 内容 |
+| `tests/filetracker/test_cli.py` | CLI 子命令 scan/commit/undo/symbols、undo 无内容、compact 与 llm 格式、无变更提示 |
 | `tests/symbol_tracker/test_python_parser.py` | 语法错误安全回退、签名解析、类/方法限定名、嵌套函数、body_hash |
 | `tests/symbol_tracker/test_symbol_tracker.py` | 重命名=删除+新增、仅改体=MODIFIED、增删符号、无解析器跳过、to_llm_text |
